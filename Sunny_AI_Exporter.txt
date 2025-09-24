@@ -1,0 +1,243 @@
+ÿþ//+------------------------------------------------------------------+ 
+//|                            Sunny_AI_Exporter (IST, ultra-low-lat) 
+//|   Rules: (1) Full broker history first (oldest->newest, bottom) 
+//|          (2) Live snapshot ALWAYS at Row-2 (header fixed) 
+//|          (3) Stable TSV headers (tab-separated), IST timestamps 
+//+------------------------------------------------------------------+ 
+#property strict 
+ 
+// ---------------------- USER SETTINGS ---------------------- 
+input string  OutRoot         = "AI_Trading_Software";  // under MQL5\Files 
+input string  SymbolFilter    = "";                     // "" = chart symbol 
+input bool    BackfillOnInit  = true;                   // pull broker max 
+input int     BackfillBarsM1  = 200000;                 // safety cap 
+input bool    WriteOnEveryTick= true;                   // live Row-2 
+// ----------------------------------------------------------- 
+ 
+// -------- Timeframes in fixed order -------- 
+enum ENUM_TIMEFRAMES_EXT { _M1=PERIOD_M1,_M5=PERIOD_M5,_M15=PERIOD_M15,_M30=PERIOD_M30, 
+                           _H1=PERIOD_H1,_H4=PERIOD_H4,_D1=PERIOD_D1,_W1=PERIOD_W1,_MN1=PERIOD_MN1 }; 
+ENUM_TIMEFRAMES TFs[] = { PERIOD_M1, PERIOD_M5, PERIOD_M15, PERIOD_M30, PERIOD_H1, PERIOD_H4, PERIOD_D1, PERIOD_W1, PERIOD_MN1 }; 
+string TFTag(ENUM_TIMEFRAMES tf){ 
+   switch(tf){ 
+      case PERIOD_M1:  return "1m"; 
+      case PERIOD_M5:  return "5m"; 
+      case PERIOD_M15: return "15m"; 
+      case PERIOD_M30: return "30m"; 
+      case PERIOD_H1:  return "1h"; 
+      case PERIOD_H4:  return "4h"; 
+      case PERIOD_D1:  return "1d"; 
+      case PERIOD_W1:  return "1w"; 
+      case PERIOD_MN1: return "1mo"; 
+   } 
+   return "tf"; 
+} 
+ 
+// ----------------- Globals ----------------- 
+string  g_symbol; 
+long    g_login; 
+string  g_server; 
+string  g_currency; 
+double  g_leverage; 
+ 
+string  g_accountFolder;                 // <Login>_<Server> 
+string  g_mainFile;                      // <Symbol><Login><Server>.csv 
+ 
+// ------------- IST + helpers -------------- 
+datetime ToIST(datetime t){ return t + 19800; } // +05:30 
+string   Tab(){ return "\t"; } 
+string   DateStr(datetime t){ MqlDateTime dt; TimeToStruct(t,dt); return StringFormat("%04d-%02d-%02d",dt.year,dt.mon,dt.day); } 
+string   TimeStr(datetime t){ MqlDateTime dt; TimeToStruct(t,dt); return StringFormat("%02d:%02d:%02d",dt.hour,dt.min,dt.sec); } 
+ 
+bool EnsureDir(string sub){ StringReplace(sub,"/","\\"); return FolderCreate(sub); } 
+bool FileExists(string rel){ int h=FileOpen(rel, FILE_READ|FILE_ANSI|FILE_SHARE_READ); if(h==INVALID_HANDLE) return false; FileClose(h); return true; } 
+bool HeaderMatches(string rel, string expected){ 
+   int h=FileOpen(rel, FILE_READ|FILE_ANSI|FILE_SHARE_READ); if(h==INVALID_HANDLE) return false; 
+   string first=FileReadString(h); FileClose(h); return (first==expected); 
+} 
+ 
+// ------------- Header (TSV) --------------- 
+string BaseHeader(){ 
+   string h="symbol\tlogin_id\tserver_id\tcurrency\tbalance\tequity\tmargin\tfree_margin\tleverage"; 
+   // live prices (ASK -> SPREAD -> BID) + IST time/date 
+   h+=Tab()+"ask"+Tab()+"ask_time"+Tab()+"ask_date"; 
+   h+=Tab()+"spread"+Tab()+"spread_time"+Tab()+"spread_date"; 
+   h+=Tab()+"bid"+Tab()+"bid_time"+Tab()+"bid_date"; 
+   // Multi-TF OHLC (each with time+date) 
+   for(int i=0;i<ArraySize(TFs);i++){ 
+      string t=TFTag(TFs[i]); 
+      h+=Tab()+t+"_open"+Tab()+t+"_open_time"+Tab()+t+"_open_date"; 
+      h+=Tab()+t+"_high"+Tab()+t+"_high_time"+Tab()+t+"_high_date"; 
+      h+=Tab()+t+"_low"+Tab()+t+"_low_time"+Tab()+t+"_low_date"; 
+      h+=Tab()+t+"_close"+Tab()+t+"_close_time"+Tab()+t+"_close_date"; 
+   } 
+   return h; 
+} 
+ 
+// --------- File write helpers (header-safe) --------- 
+bool PrependUnderHeader(const string rel, const string header, const string line){ 
+   // Re-write header + new live row, then old body 
+   string body=""; 
+   if(FileExists(rel)){ 
+      int r=FileOpen(rel, FILE_READ|FILE_ANSI|FILE_SHARE_READ); 
+      if(r==INVALID_HANDLE) return false; 
+      string first=FileReadString(r); 
+      if(first==header){ 
+         while(!FileIsEnding(r)){ string s=FileReadString(r); body+=(body==""?"":"\n")+s; } 
+      } 
+      FileClose(r); 
+   } 
+   int w=FileOpen(rel, FILE_WRITE|FILE_ANSI); if(w==INVALID_HANDLE) return false; 
+   FileWriteString(w, header+"\n"); 
+   FileWriteString(w, line+"\n");           // always Row-2 
+   if(body!="") FileWriteString(w, body+"\n"); 
+   FileClose(w); 
+   return true; 
+} 
+ 
+bool AppendLine(const string rel, const string header, const string line){ 
+   // Append to bottom; if file new or header differs, normalize header first 
+   int h=FileOpen(rel, FILE_READ|FILE_WRITE|FILE_ANSI|FILE_SHARE_READ); 
+   if(h==INVALID_HANDLE){ 
+      h=FileOpen(rel, FILE_WRITE|FILE_ANSI); if(h==INVALID_HANDLE) return false; 
+      FileWriteString(h, header+"\n"); 
+   }else{ 
+      string first=FileReadString(h); 
+      if(first!=header){ 
+         string body=""; 
+         while(!FileIsEnding(h)){ string s=FileReadString(h); body+=(body==""?"":"\n")+s; } 
+         FileClose(h); 
+         h=FileOpen(rel, FILE_WRITE|FILE_ANSI); if(h==INVALID_HANDLE) return false; 
+         FileWriteString(h, header+"\n"); 
+         if(body!="") FileWriteString(h, body+"\n"); 
+      }else{ 
+         FileSeek(h,0,SEEK_END); 
+      } 
+   } 
+   FileWriteString(h, line+"\n"); 
+   FileClose(h); 
+   return true; 
+} 
+ 
+// ----------------- Data collectors ----------------- 
+void CollectAccount(string &sym,string &cur,double &bal,double &eq,double &mar,double &fm,double &lev_out){ 
+   sym=(SymbolFilter==""?_Symbol:SymbolFilter); 
+   cur=AccountInfoString(ACCOUNT_CURRENCY); 
+   bal=AccountInfoDouble(ACCOUNT_BALANCE); 
+   eq =AccountInfoDouble(ACCOUNT_EQUITY); 
+   mar=AccountInfoDouble(ACCOUNT_MARGIN); 
+   fm =AccountInfoDouble(ACCOUNT_FREEMARGIN); 
+   lev_out=(double)AccountInfoInteger(ACCOUNT_LEVERAGE); 
+} 
+void CollectPrices(double &bid,double &ask,double &spr){ 
+   bid=SymbolInfoDouble(g_symbol,SYMBOL_BID); 
+   ask=SymbolInfoDouble(g_symbol,SYMBOL_ASK); 
+   double pt=SymbolInfoDouble(g_symbol,SYMBOL_POINT); 
+   spr=(pt>0.0? (ask-bid)/pt : 0.0); 
+} 
+bool TF_OHLC(ENUM_TIMEFRAMES tf,double &o,double &h,double &l,double &c,datetime &tbar){ 
+   int shift=1; // last closed bar only 
+   o=iOpen(g_symbol,tf,shift); 
+   h=iHigh(g_symbol,tf,shift); 
+   l=iLow(g_symbol, tf,shift); 
+   c=iClose(g_symbol,tf,shift); 
+   tbar=iTime(g_symbol,tf,shift); 
+   return (tbar>0); 
+} 
+ 
+// ----------------- Row builders ----------------- 
+string BuildLiveSnapshot(){ 
+   string line=""; 
+   double bal,eq,mar,fm,lev; string sym,cur; CollectAccount(sym,cur,bal,eq,mar,fm,lev); 
+   double bid,ask,spr; CollectPrices(bid,ask,spr); 
+   datetime now_ist=ToIST(TimeCurrent()); 
+ 
+   // identity + account 
+   line += sym + Tab() + IntegerToString((int)g_login) + Tab() + g_server + Tab() + cur + Tab() 
+        + DoubleToString(bal,2) + Tab() + DoubleToString(eq,2) + Tab() 
+        + DoubleToString(mar,2) + Tab() + DoubleToString(fm,2) + Tab() 
+        + DoubleToString(lev,0); 
+ 
+   // ask/spread/bid (IST) 
+   string tstr=TimeStr(now_ist), dstr=DateStr(now_ist); 
+   line+=Tab()+DoubleToString(ask,_Digits)+Tab()+tstr+Tab()+dstr; 
+   line+=Tab()+DoubleToString(spr,1)       +Tab()+tstr+Tab()+dstr; 
+   line+=Tab()+DoubleToString(bid,_Digits)+Tab()+tstr+Tab()+dstr; 
+ 
+   // Multi-TF OHLC (last closed bar of each TF) 
+   for(int i=0;i<ArraySize(TFs);i++){ 
+      double o,h,l,c; datetime tb; bool ok=TF_OHLC(TFs[i],o,h,l,c,tb); 
+      datetime tb_ist=ToIST(tb); 
+      string tt=(ok?TimeStr(tb_ist):""), dd=(ok?DateStr(tb_ist):""); 
+      line+=Tab()+DoubleToString(o,_Digits)+Tab()+tt+Tab()+dd; 
+      line+=Tab()+DoubleToString(h,_Digits)+Tab()+tt+Tab()+dd; 
+      line+=Tab()+DoubleToString(l,_Digits)+Tab()+tt+Tab()+dd; 
+      line+=Tab()+DoubleToString(c,_Digits)+Tab()+tt+Tab()+dd; 
+   } 
+   return line; 
+} 
+ 
+// M1 bar  ’! historical row (bid/time from bar; M1 OHLC filled; other TF blanks) 
+string BuildHistoricalLine(const MqlRates &bar){ 
+   string line=""; 
+   double bal,eq,mar,fm,lev; string sym,cur; CollectAccount(sym,cur,bal,eq,mar,fm,lev); 
+   datetime bist=ToIST(bar.time); 
+ 
+   line += sym + Tab() + IntegerToString((int)g_login) + Tab() + g_server + Tab() + cur + Tab() 
+        + DoubleToString(bal,2) + Tab() + DoubleToString(eq,2) + Tab() 
+        + DoubleToString(mar,2) + Tab() + DoubleToString(fm,2) + Tab() 
+        + DoubleToString(lev,0); 
+ 
+   // historical ask/spread unknown 
+   line+=Tab()+""+Tab()+""+Tab()+""; 
+   line+=Tab()+""+Tab()+""+Tab()+""; 
+   // bid from bar close + bar time/date (IST) 
+   line+=Tab()+DoubleToString(bar.close,_Digits) + Tab()+TimeStr(bist) + Tab()+DateStr(bist); 
+ 
+   // M1 OHLC from bar 
+   line+=Tab()+DoubleToString(bar.open,_Digits)  + Tab()+TimeStr(bist)+Tab()+DateStr(bist); 
+   line+=Tab()+DoubleToString(bar.high,_Digits)  + Tab()+TimeStr(bist)+Tab()+DateStr(bist); 
+   line+=Tab()+DoubleToString(bar.low,_Digits)   + Tab()+TimeStr(bist)+Tab()+DateStr(bist); 
+   line+=Tab()+DoubleToString(bar.close,_Digits) + Tab()+TimeStr(bist)+Tab()+DateStr(bist); 
+ 
+   // Other TFs blank triplets (placeholders) 
+   for(int i=1;i<ArraySize(TFs);i++){ 
+      line+=Tab()+""+Tab()+""+Tab()+""; // open 
+      line+=Tab()+""+Tab()+""+Tab()+""; // high 
+      line+=Tab()+""+Tab()+""+Tab()+""; // low 
+      line+=Tab()+""+Tab()+""+Tab()+""; // close 
+   } 
+   return line; 
+} 
+ 
+// ----------------- Header / filenames ----------------- 
+bool EnsureMainHeader(){ 
+   string accountRoot = IntegerToString((int)g_login) + "_" + g_server; 
+   g_accountFolder = OutRoot + "\\" + accountRoot; 
+   if(!EnsureDir(g_accountFolder)) return false; 
+ 
+   string base = g_accountFolder + "\\" + g_symbol + "" + IntegerToString((int)g_login) + "" + g_server; 
+   g_mainFile = base + ".csv"; 
+ 
+   string hdr = BaseHeader(); 
+   if(!FileExists(g_mainFile)){ 
+      int w=FileOpen(g_mainFile, FILE_WRITE|FILE_ANSI); if(w==INVALID_HANDLE) return false; 
+      FileWriteString(w, hdr+"\n"); FileClose(w); 
+      return true; 
+   } 
+   if(!HeaderMatches(g_mainFile,hdr)){ 
+      int w=FileOpen(g_mainFile, FILE_WRITE|FILE_ANSI); if(w==INVALID_HANDLE) return false; 
+      FileWriteString(w, hdr+"\n"); FileClose(w); 
+   } 
+   return true; 
+} 
+ 
+// ----------------------- MT5 Events ----------------------- 
+int OnInit(){ 
+   g_symbol = (SymbolFilter==""?_Symbol:SymbolFilter); 
+   g_login  = AccountInfoInteger(ACCOUNT_LOGIN); 
+   g_server = AccountInfoString(ACCOUNT_SERVER); 
+   g_currency = AccountInfoString(ACCOUNT_CURRENCY); 
+   g_leverage = (double)AccountInfoInteger(ACCOUNT_LEVERAGE); 
+ 
+   if(!EnsureMainHeader()){ Print("Header prep
